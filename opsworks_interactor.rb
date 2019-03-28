@@ -3,7 +3,8 @@ require 'timeout'
 
 class OpsworksInteractor
 
-  def initialize(access_key_id, secret_access_key, region = 'us-east-1')
+  def initialize(access_key_id, secret_access_key, region = 'us-east-1', regional_deploy = false)
+    @regional_deploy = regional_deploy
     # All opsworks endpoints are always in the OPSWORKS_REGION
     @opsworks_client = Aws::OpsWorks::Client.new(
       access_key_id:     access_key_id,
@@ -15,40 +16,18 @@ class OpsworksInteractor
       access_key_id:     access_key_id,
       secret_access_key: secret_access_key,
       # At CareerBuilder INTL, one of the stacks use the OpsWorks API in region us-east-1 but the machines and ELBs are in eu-west-1
-      region: region == 'us-east-1' ? 'eu-west-1' : region
+      region: get_region(region, regional_deploy)
     )
+  end
+
+  def get_region(region, regional_deploy)
+    region = 'eu-west-1' if region == 'us-east-1' && !regional_deploy
+    region
   end
 
   def debug
     all_load_balancers = @elb_client.describe_load_balancers.load_balancer_descriptions
     log(@elb_client.describe_load_balancers.inspect)
-  end
-
-  def deploy_step(stack_id:, app_id:, command:, deploy_timeout: 1800)
-    instances = @opsworks_client.describe_instances(stack_id: stack_id)[:instances]
-    deploy_id = []
-
-    instances.each do |instance|
-      # Only deploy to online instances
-      next unless instance.status == 'online'
-
-      response = @opsworks_client.create_deployment(
-        stack_id:     stack_id,
-        app_id:       app_id,
-        instance_ids: [instance.instance_id],
-        command: {
-          name: command
-        }
-      )
-      log("#{command} process running (id: #{response[:deployment_id]})...")
-      deploy_id.push(response[:deployment_id])
-    end
-
-    deploy_id.each do |id|
-      wait_until_deploy_completion(id, deploy_timeout)
-    end
-
-    log("✓ #{command} completed")
   end
 
   # Deploys the given app_id on the given instance_id in the given stack_id
@@ -72,10 +51,12 @@ class OpsworksInteractor
         )
       end
 
+      instance_id = [instance_id] unless instance_id.is_a?(Array)
+
       response = @opsworks_client.create_deployment(
         stack_id:     stack_id,
         app_id:       id,
-        instance_ids: [instance_id],
+        instance_ids: instance_id,
         command: {
           name: 'deploy'
         }
@@ -98,6 +79,53 @@ class OpsworksInteractor
   # Register instance back to ELB
   # Wait for AWS to confirm the instance as registered and healthy
   # Once complete, move onto the next instance and repeat
+  def regional_rolling_deploy(stack_id:, layer_id:, app_id:, revision: '')
+    log("Starting opsworks deploy for app #{app_id}\n\n")
+
+    instances = @opsworks_client.describe_instances(layer_id: layer_id)[:instances]
+
+    instances_by_group = instances.map {|v| v.to_h}.group_by { |d| d[:availability_zone] }
+
+    instances_by_group.each do |region, instance_group|
+      # Only deploy to online instances
+      online_instance = instance_group.select{|k| k[:status] == 'online'}
+      instances_ids = online_instance.map{|k| k[:instance_id]}
+      instances_names = online_instance.map{|k| k[:hostname]}
+
+      puts "#{instances_names} in #{region}"
+
+      begin
+        load_balancers = {}
+        log("=== Starting deploy for #{instances_names} ===")
+
+        online_instance.each do |instance|
+          instance = Aws::OpsWorks::Types::Instance.new(instance)
+          load_balancers[instance.instance_id] = detach_from_elbs(instance: instance)
+        end
+
+        wait_for_detach(@lb_wait_params)
+
+        deploy(
+          stack_id: stack_id,
+          app_id: app_id,
+          instance_id: instances_ids,
+          revision: revision
+        )
+      ensure
+        online_instance.each do |instance|
+          instance = Aws::OpsWorks::Types::Instance.new(instance)
+          attach_to_elbs(instance: instance, load_balancers: load_balancers[instance.instance_id]) if load_balancers[instance.instance_id]
+        end
+
+        wait_for_re_attach(@lb_wait_params)
+
+        log("=== Done deploying on #{instances_names} ===\n\n")
+      end
+    end
+
+    log("SUCCESS: completed opsworks deploy for all instances on app #{app_id}")
+  end
+
   def rolling_deploy(stack_id:, layer_id:, app_id:, revision: '')
     log("Starting opsworks deploy for app #{app_id}\n\n")
 
@@ -166,7 +194,7 @@ class OpsworksInteractor
 
     load_balancers = detach_from(all_load_balancers, instance)
 
-    lb_wait_params = []
+    @lb_wait_params = []
 
     load_balancers.each do |lb|
       params = {
@@ -184,21 +212,36 @@ class OpsworksInteractor
         #{remaining_instances.count.to_s})
       MSG
 
-      lb_wait_params << params
+      @lb_wait_params << params
     end
-
-    if lb_wait_params.any?
-      lb_wait_params.each do |params|
-        # wait for all load balancers to list the instance as deregistered
-        @elb_client.wait_until(:instance_deregistered, params)
-
-        log("✓ detached from #{params[:load_balancer_name]}")
+    
+    unless @regional_deploy
+      if @lb_wait_params.any?
+        wait_for_detach(@lb_wait_params)
+      else
+        log("No load balancers found for instance #{instance.hostname}")
       end
-    else
-      log("No load balancers found for instance #{instance.hostname}")
     end
 
     load_balancers
+  end
+
+  def wait_for_detach(lb_wait_params)
+    lb_wait_params.each do |params|
+      # wait for all load balancers to list the instance as deregistered
+      @elb_client.wait_until(:instance_deregistered, params)
+
+      log("✓ detached from #{params[:load_balancer_name]}")
+    end
+  end
+
+  def wait_for_re_attach(lb_wait_params)
+    # Wait for all load balancers to list the instance as registered
+    lb_wait_params.each do |params|
+      @elb_client.wait_until(:instance_in_service, params)
+
+      log("✓ re-attached to #{params[:load_balancer_name]}")
+    end
   end
 
   # Accepts load_balancers as array of
@@ -258,7 +301,7 @@ class OpsworksInteractor
       return {}
     end
 
-    lb_wait_params = []
+    @lb_wait_params = []
     registered_instances = {} # return this
 
     load_balancers.each do |lb|
@@ -270,16 +313,13 @@ class OpsworksInteractor
       result = @elb_client.register_instances_with_load_balancer(params)
 
       registered_instances[lb.load_balancer_name] = result
-      lb_wait_params << params
+      @lb_wait_params << params
     end
 
     log("Re-attaching instance #{instance.hostname} to all load balancers")
 
-    # Wait for all load balancers to list the instance as registered
-    lb_wait_params.each do |params|
-      @elb_client.wait_until(:instance_in_service, params)
-
-      log("✓ re-attached to #{params[:load_balancer_name]}")
+    unless @regional_deploy
+      wait_for_re_attach(@lb_wait_params)
     end
 
     registered_instances
