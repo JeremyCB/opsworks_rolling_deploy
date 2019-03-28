@@ -8,8 +8,14 @@ require_relative 'opsworks_interactor.rb'
 # 4 : layer_id
 # 5 : region
 # 6 : revision
+# 7 : regional deploy
 
-o = OpsworksInteractor.new(ARGV[0], ARGV[1], ARGV[5])
-o.rolling_deploy(stack_id: ARGV[3], layer_id: ARGV[4], app_id: ARGV[2], revision: ARGV[6])
+o = OpsworksInteractor.new(ARGV[0], ARGV[1], ARGV[5], ARGV[7])
 
-#o.debug
+if ARGV[7]
+	puts "Doing regional rolling deploy"
+	o.regional_rolling_deploy(stack_id: ARGV[3], layer_id: ARGV[4], app_id: ARGV[2], revision: ARGV[6])
+else
+	puts "Doing classic rolling deploy"
+	o.rolling_deploy(stack_id: ARGV[3], layer_id: ARGV[4], app_id: ARGV[2], revision: ARGV[6])
+end
