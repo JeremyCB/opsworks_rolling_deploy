@@ -30,6 +30,33 @@ class OpsworksInteractor
     log(@elb_client.describe_load_balancers.inspect)
   end
 
+  def deploy_step(stack_id:, app_id:, command:, deploy_timeout: 1800)
+    instances = @opsworks_client.describe_instances(stack_id: stack_id)[:instances]
+    deploy_id = []
+
+    instances.each do |instance|
+      # Only deploy to online instances
+      next unless instance.status == 'online'
+
+      response = @opsworks_client.create_deployment(
+        stack_id:     stack_id,
+        app_id:       app_id,
+        instance_ids: [instance.instance_id],
+        command: {
+          name: command
+        }
+      )
+      log("#{command} process running (id: #{response[:deployment_id]})...")
+      deploy_id.push(response[:deployment_id])
+    end
+
+    deploy_id.each do |id|
+      wait_until_deploy_completion(id, deploy_timeout)
+    end
+
+    log("✓ #{command} completed")
+  end
+
   # Deploys the given app_id on the given instance_id in the given stack_id
   #
   # Blocks until AWS confirms that the deploy was successful
