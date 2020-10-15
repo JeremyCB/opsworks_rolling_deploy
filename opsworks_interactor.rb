@@ -119,6 +119,8 @@ class OpsworksInteractor
       instances_ids = online_instance.map{|k| k[:instance_id]}
       instances_names = online_instance.map{|k| k[:hostname]}
 
+      next if instances_names.empty?
+
       puts "#{instances_names} in #{region}"
 
       begin
