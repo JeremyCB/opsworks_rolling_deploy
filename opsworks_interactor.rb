@@ -20,6 +20,19 @@ class OpsworksInteractor
     )
   end
 
+  def list_apps(stack_id)
+    @opsworks_client.describe_apps(stack_id: stack_id)
+  end
+
+  def reset_app_revision(app_id)
+    @opsworks_client.update_app(
+      {
+        app_id: app_id,
+        app_source: {revision: 'master'}
+      }
+    )
+  end
+
   def get_region(region, regional_deploy)
     region = 'eu-west-1' if region == 'us-east-1' && !regional_deploy
     region
